@@ -27,6 +27,7 @@ import random
 import sys
 import uuid
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -326,6 +327,66 @@ def _hit_score_to_type(hit_count: int) -> Tuple[str, str]:
         return "light_negative", "easy"
 
 
+def _mine_negatives_worker(
+    chunk_rows: List[dict],
+    index: NameIndex,
+    rows_cache: List[dict],
+    top_k: int,
+    seed: int,
+) -> Tuple[List[dict], List[dict]]:
+    """
+    Worker function for parallel negative mining.
+    Processes a chunk of rows and returns (light_pairs, hard_pairs).
+    """
+    light_pairs: List[dict] = []
+    hard_pairs: List[dict] = []
+    seen_pairs = set()
+    rng = random.Random(seed)
+
+    for row in chunk_rows:
+        q_name = row["noisy_name"]
+        q_lid = row["latent_id"]
+
+        ranked = index.candidates(
+            q_name, q_lid, top_k=top_k,
+            tokens=row.get("tokens"),
+            ngrams=row.get("ngrams3"),
+            phoneme_set=row.get("metaphone_set"),
+            init=row.get("initials")
+        )
+
+        for row_idx, hit_cnt in ranked:
+            c_row = rows_cache[row_idx]
+            c_name = c_row["noisy_name"]
+            c_lid = c_row["latent_id"]
+
+            if c_lid == q_lid:
+                continue
+
+            pair_key = tuple(sorted([f"{q_lid}|{normalize(q_name)}", f"{c_lid}|{normalize(c_name)}"]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            ptype, _ = _hit_score_to_type(hit_cnt)
+
+            p = build_negative_pair(
+                q_lid, q_name, c_lid, c_name, ptype,
+                notes=f"neighbourhood_hits={hit_cnt}",
+                q_features=row,
+                c_features=c_row
+            )
+            if p is None:
+                continue
+
+            if ptype == "hard_negative":
+                hard_pairs.append(p)
+            else:
+                light_pairs.append(p)
+
+    return light_pairs, hard_pairs
+
+
 def generate_negatives(
     df: pd.DataFrame,
     index: NameIndex,
@@ -334,19 +395,18 @@ def generate_negatives(
     rng: random.Random,
     top_k: int = 40,
     sample_frac: float = 0.3,
+    num_workers: int = 4,
 ) -> List[dict]:
     """
-    Mine hard & light negatives using the NameIndex.
+    Mine hard & light negatives using the NameIndex with multiprocessing.
     Hard negatives come from top-ranked (high-hit) neighbours.
     Light negatives come from mid-ranked neighbours.
     
     sample_frac: fraction of rows to sample for negative mining (default 0.3 = 30%).
     top_k: max neighbourhood candidates per query (default 40).
+    num_workers: number of CPU cores to use for parallel mining (default 4).
     """
-    light_pairs: List[dict] = []
-    hard_pairs:  List[dict] = []
-
-    # Cache entire dataframe as dict list to avoid expensive .iloc calls in loops
+    # Cache entire dataframe as dict list to avoid expensive .iloc calls
     rows_cache = df.to_dict("records")
 
     # Sample a fraction of rows to speed up mining
@@ -354,50 +414,61 @@ def generate_negatives(
     sampled_df = df.sample(n=sample_size, random_state=rng.randint(0, 9999))
     rows_list = sampled_df.to_dict("records")
 
-    seen_pairs = set()
+    # Split rows into chunks for parallel processing
+    chunk_size = max(1, len(rows_list) // num_workers)
+    chunks = [rows_list[i:i + chunk_size] for i in range(0, len(rows_list), chunk_size)]
 
-    for row in tqdm(rows_list, desc="Mining negatives", leave=False):
-        if len(light_pairs) >= light_target and len(hard_pairs) >= hard_target:
-            break
+    print(f"   Distributing {len(rows_list):,} samples across {len(chunks)} workers…")
 
-        q_name = row["noisy_name"]
-        q_lid  = row["latent_id"]
+    # Mine negatives in parallel
+    light_pairs_all: List[dict] = []
+    hard_pairs_all: List[dict] = []
+    seen_pairs_global = set()
 
-        ranked = index.candidates(q_name, q_lid, top_k=top_k)
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(
+                _mine_negatives_worker,
+                chunk,
+                index,
+                rows_cache,
+                top_k,
+                rng.randint(0, 9999999),
+            )
+            for chunk in chunks
+        ]
 
-        for row_idx, hit_cnt in ranked:
-            c_row  = rows_cache[row_idx]
-            c_name = c_row["noisy_name"]
-            c_lid  = c_row["latent_id"]
+        for future in tqdm(futures, desc="Mining negatives", leave=False):
+            light_pairs, hard_pairs = future.result()
+            
+            # Deduplicate across chunks
+            for pair in light_pairs:
+                pair_key = tuple(sorted([
+                    f"{pair['query_latent_id']}|{pair['query_name']}",
+                    f"{pair['candidate_latent_id']}|{pair['candidate_name']}"
+                ]))
+                if pair_key not in seen_pairs_global:
+                    light_pairs_all.append(pair)
+                    seen_pairs_global.add(pair_key)
 
-            if c_lid == q_lid:
-                continue
+            for pair in hard_pairs:
+                pair_key = tuple(sorted([
+                    f"{pair['query_latent_id']}|{pair['query_name']}",
+                    f"{pair['candidate_latent_id']}|{pair['candidate_name']}"
+                ]))
+                if pair_key not in seen_pairs_global:
+                    hard_pairs_all.append(pair)
+                    seen_pairs_global.add(pair_key)
 
-            pair_key = tuple(sorted([f"{q_lid}|{normalize(q_name)}", f"{c_lid}|{normalize(c_name)}"])) 
-            if pair_key in seen_pairs:
-                continue
-            seen_pairs.add(pair_key)
-
-            ptype, _ = _hit_score_to_type(hit_cnt)
-
-            p = build_negative_pair(q_lid, q_name, c_lid, c_name, ptype,
-                                    notes=f"neighbourhood_hits={hit_cnt}",
-                                    q_features=row,
-                                    c_features=c_row)
-            if p is None:
-                continue
-
-            if ptype == "hard_negative":
-                if len(hard_pairs) < hard_target:
-                    hard_pairs.append(p)
-            else:
-                if len(light_pairs) < light_target:
-                    light_pairs.append(p)
-
-            if len(light_pairs) >= light_target and len(hard_pairs) >= hard_target:
+            # Early exit if we have enough pairs
+            if len(light_pairs_all) >= light_target and len(hard_pairs_all) >= hard_target:
                 break
 
-    return light_pairs + hard_pairs
+    # Trim to targets
+    light_pairs_all = light_pairs_all[:light_target]
+    hard_pairs_all = hard_pairs_all[:hard_target]
+
+    return light_pairs_all + hard_pairs_all
 
 
 # ── Index builder ──────────────────────────────────────────────────────────────
@@ -480,7 +551,8 @@ def run(args):
     # ── Negatives ──
     print("\n❌  Mining negative pairs …")
     neg_pairs = generate_negatives(df, idx, n_lneg, n_hneg, rng,
-                                    top_k=args.top_k, sample_frac=args.neg_sample_frac)
+                                    top_k=args.top_k, sample_frac=args.neg_sample_frac,
+                                    num_workers=args.num_workers)
     print(f"   Generated {len(neg_pairs):,} negative pairs")
 
     # ── Combine & save ──
@@ -525,6 +597,8 @@ def parse_args():
                    help="Fraction of rows to sample for negative mining (default 0.3 = 30%%)")
     p.add_argument("--top_k",       type=int,   default=40,
                    help="Max neighbourhood candidates per query (default 40)")
+    p.add_argument("--num_workers", type=int,   default=4,
+                   help="Number of CPU cores for parallel negative mining (default 4)")
     return p.parse_args()
 
 
