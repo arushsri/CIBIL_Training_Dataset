@@ -171,10 +171,11 @@ def build_positive_pair(
         feats = compute_features(q_name, c_name)
     else:
         feats = compute_features_precomputed(
-            q_features["tokens"], c_features["tokens"],
-            q_features["ngrams3"], c_features["ngrams3"],
-            q_features["metaphone_set"], c_features["metaphone_set"],
-            q_features["norm_name"], c_features["norm_name"]
+            q_features.get("token_set", set(q_features.get("tokens", []))),
+            c_features.get("token_set", set(c_features.get("tokens", []))),
+            q_features.get("ngrams3", set()), c_features.get("ngrams3", set()),
+            q_features.get("metaphone_set", set()), c_features.get("metaphone_set", set()),
+            q_features.get("norm_name", normalize(q_name)), c_features.get("norm_name", normalize(c_name))
         )
     
     diff  = pair_difficulty(feats, label=1)
@@ -210,10 +211,11 @@ def build_negative_pair(
         feats = compute_features(q_name, c_name)
     else:
         feats = compute_features_precomputed(
-            q_features["tokens"], c_features["tokens"],
-            q_features["ngrams3"], c_features["ngrams3"],
-            q_features["metaphone_set"], c_features["metaphone_set"],
-            q_features["norm_name"], c_features["norm_name"]
+            q_features.get("token_set", set(q_features.get("tokens", []))),
+            c_features.get("token_set", set(c_features.get("tokens", []))),
+            q_features.get("ngrams3", set()), c_features.get("ngrams3", set()),
+            q_features.get("metaphone_set", set()), c_features.get("metaphone_set", set()),
+            q_features.get("norm_name", normalize(q_name)), c_features.get("norm_name", normalize(c_name))
         )
     
     diff  = pair_difficulty(feats, label=0)
