@@ -37,6 +37,7 @@ from tqdm import tqdm
 from name_pair_utils import (
     char_ngrams,
     compute_features,
+    compute_features_precomputed,
     initials,
     metaphones,
     normalize,
@@ -60,23 +61,33 @@ class NameIndex:
         self.initials_idx: defaultdict = defaultdict(list)
         self.surname_idx:  defaultdict = defaultdict(list)
 
-    def add(self, latent_id, name: str, row_idx: int):
+    def add(self, latent_id, name: str, row_idx: int, 
+            tokens: list = None, ngrams: set = None, 
+            phoneme_set: set = None, init: str = None):
+        """Add entry to index. Optionally accepts pre-computed features to avoid recomputation."""
         entry = (latent_id, name, row_idx)
 
-        for gram in char_ngrams(name, 3):
+        # Use pre-computed or compute on demand
+        if ngrams is None:
+            ngrams = char_ngrams(name, 3)
+        for gram in ngrams:
             self.ngram_idx[gram].append(entry)
 
-        for tok in tokenize(name):
+        if tokens is None:
+            tokens = tokenize(name)
+        for tok in tokens:
             self.token_idx[tok].append(entry)
 
-        for code in metaphones(name):
+        if phoneme_set is None:
+            phoneme_set = metaphones(name)
+        for code in phoneme_set:
             self.phonetic_idx[code].append(entry)
 
-        init = initials(name)
+        if init is None:
+            init = initials(name)
         if init:
             self.initials_idx[init].append(entry)
 
-        tokens = tokenize(name)
         if tokens:
             self.surname_idx[tokens[-1]].append(entry)
 
@@ -85,35 +96,47 @@ class NameIndex:
         name: str,
         query_latent_id,
         top_k: int = 50,
+        tokens: list = None,
+        ngrams: set = None,
+        phoneme_set: set = None,
+        init: str = None,
     ) -> List[Tuple]:
         """
         Return up to `top_k` candidate (latent_id, name, row_idx) tuples
         from DIFFERENT identities, ranked by neighbourhood hit count.
+        Optionally accepts pre-computed features to avoid recomputation.
         """
         hit_count: Dict[int, int] = defaultdict(int)  # row_idx → hits
 
-        for gram in char_ngrams(name, 3):
+        # Use pre-computed or compute on demand
+        if ngrams is None:
+            ngrams = char_ngrams(name, 3)
+        for gram in ngrams:
             for entry in self.ngram_idx.get(gram, []):
                 if entry[0] != query_latent_id:
                     hit_count[entry[2]] += 2        # weight ngrams higher
 
-        for tok in tokenize(name):
+        if tokens is None:
+            tokens = tokenize(name)
+        for tok in tokens:
             for entry in self.token_idx.get(tok, []):
                 if entry[0] != query_latent_id:
                     hit_count[entry[2]] += 3        # token overlap is strong signal
 
-        for code in metaphones(name):
+        if phoneme_set is None:
+            phoneme_set = metaphones(name)
+        for code in phoneme_set:
             for entry in self.phonetic_idx.get(code, []):
                 if entry[0] != query_latent_id:
                     hit_count[entry[2]] += 2
 
-        init = initials(name)
+        if init is None:
+            init = initials(name)
         if init:
             for entry in self.initials_idx.get(init, []):
                 if entry[0] != query_latent_id:
                     hit_count[entry[2]] += 4        # initials collision = hard-negative gold
 
-        tokens = tokenize(name)
         if tokens:
             for entry in self.surname_idx.get(tokens[-1], []):
                 if entry[0] != query_latent_id:
@@ -136,10 +159,23 @@ def build_positive_pair(
     c_name: str,
     c_latent_id,
     notes: str = "",
+    q_features: dict = None,
+    c_features: dict = None,
 ) -> Optional[dict]:
     if normalize(q_name) == normalize(c_name):
         return None                         # skip identical strings
-    feats = compute_features(q_name, c_name)
+    
+    # Use pre-computed features if available, otherwise compute
+    if q_features is None or c_features is None:
+        feats = compute_features(q_name, c_name)
+    else:
+        feats = compute_features_precomputed(
+            q_features["tokens"], c_features["tokens"],
+            q_features["ngrams3"], c_features["ngrams3"],
+            q_features["metaphone_set"], c_features["metaphone_set"],
+            q_features["norm_name"], c_features["norm_name"]
+        )
+    
     diff  = pair_difficulty(feats, label=1)
     return {
         "pair_id":             make_pair_id(),
@@ -162,10 +198,23 @@ def build_negative_pair(
     c_name: str,
     pair_type: str,
     notes: str = "",
+    q_features: dict = None,
+    c_features: dict = None,
 ) -> Optional[dict]:
     if q_latent_id == c_latent_id:
         return None
-    feats = compute_features(q_name, c_name)
+    
+    # Use pre-computed features if available, otherwise compute
+    if q_features is None or c_features is None:
+        feats = compute_features(q_name, c_name)
+    else:
+        feats = compute_features_precomputed(
+            q_features["tokens"], c_features["tokens"],
+            q_features["ngrams3"], c_features["ngrams3"],
+            q_features["metaphone_set"], c_features["metaphone_set"],
+            q_features["norm_name"], c_features["norm_name"]
+        )
+    
     diff  = pair_difficulty(feats, label=0)
 
     # Reject pairs that are too dissimilar to be useful negatives
@@ -220,7 +269,8 @@ def generate_positives(
             for a, b in itertools.combinations(single_rows, 2):
                 p = build_positive_pair(
                     lid, a["noisy_name"], b["noisy_name"], lid,
-                    notes="single_noise_pair"
+                    notes="single_noise_pair",
+                    q_features=a, c_features=b
                 )
                 if p:
                     single_pairs.append(p)
@@ -232,7 +282,8 @@ def generate_positives(
             for nr in noisy_rows:
                 p = build_positive_pair(
                     lid, cr["noisy_name"], nr["noisy_name"], lid,
-                    notes="clean_vs_noisy"
+                    notes="clean_vs_noisy",
+                    q_features=cr, c_features=nr
                 )
                 if p:
                     single_pairs.append(p)
@@ -244,7 +295,8 @@ def generate_positives(
                     continue
                 p = build_positive_pair(
                     lid, cr["noisy_name"], nr["noisy_name"], lid,
-                    notes="combined_noise_pair"
+                    notes="combined_noise_pair",
+                    q_features=cr, c_features=nr
                 )
                 if p:
                     combined_pairs.append(p)
@@ -294,6 +346,9 @@ def generate_negatives(
     light_pairs: List[dict] = []
     hard_pairs:  List[dict] = []
 
+    # Cache entire dataframe as dict list to avoid expensive .iloc calls in loops
+    rows_cache = df.to_dict("records")
+
     # Sample a fraction of rows to speed up mining
     sample_size = max(1, int(len(df) * sample_frac))
     sampled_df = df.sample(n=sample_size, random_state=rng.randint(0, 9999))
@@ -311,7 +366,7 @@ def generate_negatives(
         ranked = index.candidates(q_name, q_lid, top_k=top_k)
 
         for row_idx, hit_cnt in ranked:
-            c_row  = df.iloc[row_idx]
+            c_row  = rows_cache[row_idx]
             c_name = c_row["noisy_name"]
             c_lid  = c_row["latent_id"]
 
@@ -326,7 +381,9 @@ def generate_negatives(
             ptype, _ = _hit_score_to_type(hit_cnt)
 
             p = build_negative_pair(q_lid, q_name, c_lid, c_name, ptype,
-                                    notes=f"neighbourhood_hits={hit_cnt}")
+                                    notes=f"neighbourhood_hits={hit_cnt}",
+                                    q_features=row,
+                                    c_features=c_row)
             if p is None:
                 continue
 
@@ -347,8 +404,17 @@ def generate_negatives(
 
 def build_index(df: pd.DataFrame) -> NameIndex:
     idx = NameIndex()
-    for i, row in tqdm(df.iterrows(), total=len(df), desc="Building index"):
-        idx.add(row["latent_id"], row["noisy_name"], i)
+    rows_list = df.to_dict("records")
+    for i, row in tqdm(enumerate(rows_list), total=len(df), desc="Building index"):
+        idx.add(
+            row["latent_id"], 
+            row["noisy_name"], 
+            i,
+            tokens=row.get("tokens"),
+            ngrams=row.get("ngrams3"),
+            phoneme_set=row.get("metaphone_set"),
+            init=row.get("initials")
+        )
     return idx
 
 
@@ -378,6 +444,15 @@ def run(args):
 
     print(f"   Rows: {len(df):,}   |   Unique identities: {df['latent_id'].nunique():,}")
 
+    print("\n⚡ Precomputing normalized features...")
+    df["norm_name"] = df["noisy_name"].map(normalize)
+    df["tokens"] = df["noisy_name"].map(tokenize)
+    df["token_set"] = df["tokens"].map(set)
+    df["ngrams3"] = df["noisy_name"].map(lambda x: char_ngrams(x, 3))
+    df["metaphone_set"] = df["noisy_name"].map(metaphones)
+    df["initials"] = df["noisy_name"].map(initials)
+    print("   ✓ Feature precomputation complete")
+
     # Target pair counts
     total  = args.pairs
     n_pos  = int(total * args.pos_ratio)
@@ -389,8 +464,9 @@ def run(args):
     # ── Build identity groups ──
     print("\n🔧  Grouping by latent_id …")
     identity_groups: Dict[str, List[dict]] = defaultdict(list)
-    for _, row in df.iterrows():
-        identity_groups[row["latent_id"]].append(row.to_dict())
+    rows_list = df.to_dict("records")
+    for row in rows_list:
+        identity_groups[row["latent_id"]].append(row)
 
     # ── Positives ──
     print("\n✅  Generating positive pairs …")

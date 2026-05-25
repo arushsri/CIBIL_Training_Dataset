@@ -65,6 +65,14 @@ def token_jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(union) if union else 0.0
 
 
+def token_jaccard_precomputed(ta: Set[str], tb: Set[str]) -> float:
+    """Compute Jaccard similarity from pre-computed token sets."""
+    if not ta and not tb:
+        return 1.0
+    union = ta | tb
+    return len(ta & tb) / len(union) if union else 0.0
+
+
 def char_ngrams(s: str, n: int = 3) -> Set[str]:
     s = normalize(s).replace(" ", "")
     return set(s[i:i+n] for i in range(len(s) - n + 1))
@@ -72,6 +80,14 @@ def char_ngrams(s: str, n: int = 3) -> Set[str]:
 
 def char_ngram_similarity(a: str, b: str, n: int = 3) -> float:
     ga, gb = char_ngrams(a, n), char_ngrams(b, n)
+    if not ga and not gb:
+        return 1.0
+    union = ga | gb
+    return len(ga & gb) / len(union) if union else 0.0
+
+
+def char_ngram_similarity_precomputed(ga: Set[str], gb: Set[str]) -> float:
+    """Compute char-ngram similarity from pre-computed ngram sets."""
     if not ga and not gb:
         return 1.0
     union = ga | gb
@@ -90,6 +106,14 @@ def phonetic_similarity(a: str, b: str) -> float:
     return len(ma & mb) / len(union) if union else 0.0
 
 
+def phonetic_similarity_precomputed(ma: Set[str], mb: Set[str]) -> float:
+    """Compute phonetic similarity from pre-computed metaphone sets."""
+    if not ma and not mb:
+        return 1.0
+    union = ma | mb
+    return len(ma & mb) / len(union) if union else 0.0
+
+
 def edit_distance(a: str, b: str) -> int:
     return jellyfish.levenshtein_distance(normalize(a), normalize(b))
 
@@ -102,6 +126,28 @@ def compute_features(a: str, b: str) -> dict:
         "char_ngram_similarity": round(char_ngram_similarity(a, b), 4),
         "phonetic_similarity":  round(phonetic_similarity(a, b), 4),
         "edit_distance":        edit_distance(a, b),
+    }
+
+
+def compute_features_precomputed(ta: Set[str], tb: Set[str], ga: Set[str], gb: Set[str], 
+                                 ma: Set[str], mb: Set[str], 
+                                 norm_a: str, norm_b: str) -> dict:
+    """
+    Compute features from pre-computed token, ngram, and metaphone sets.
+    
+    Args:
+        ta, tb: pre-computed token sets
+        ga, gb: pre-computed char-ngram sets
+        ma, mb: pre-computed metaphone sets
+        norm_a, norm_b: pre-computed normalized strings
+    """
+    return {
+        "shared_tokens":        len(ta & tb),
+        "shared_phonetics":     len(ma & mb),
+        "token_jaccard":        round(token_jaccard_precomputed(ta, tb), 4),
+        "char_ngram_similarity": round(char_ngram_similarity_precomputed(ga, gb), 4),
+        "phonetic_similarity":  round(phonetic_similarity_precomputed(ma, mb), 4),
+        "edit_distance":        jellyfish.levenshtein_distance(norm_a, norm_b),
     }
 
 
